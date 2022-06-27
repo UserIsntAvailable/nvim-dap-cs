@@ -1,44 +1,24 @@
 local query = require("vim.treesitter.query")
+local ts_utils = require("nvim-treesitter.ts_utils")
+local utils = require("utils")
 
 local M = {}
 
 -- TODO: feat: add more test frameworks
-local single_test_query = [[
-(method_declaration
-  (attribute_list
-        (attribute
-              name: (identifier) @attribute_name))
-  name: (identifier) @test_name
+local tests_query = [[
+((class_declaration
+  name: (identifier) @class_name
+   body: (declaration_list
+     (method_declaration
+       (attribute_list
+         (attribute
+           name: (identifier) @attribute_name))
+       name: (identifier) @method_name)))
   (#match? @attribute_name "^(Fact|Theory)(Attribute)?$"))
 ]]
 
-local function require_module(module_name)
-    local status_ok, module = pcall(require, module_name)
-    assert(status_ok, string.format("dap-cs: '%s' plugin dependency is missing", module_name))
-    return module
-end
-
-local function require_executables(executables)
-    for _, executable in ipairs(executables) do
-        assert(
-            vim.fn.executable(executable) == 1 and true or false,
-            string.format("dap-cs: '%s' executable dependency is missing", executable)
-        )
-    end
-end
-
-local function launch_dotnet(opts)
-    local dotnet_args = {}
-
-    if opts.test_filter then
-        table.insert(dotnet_args, "--filter")
-        table.insert(dotnet_args, opts.test_filter)
-    end
-
-    if opts.no_build then
-        table.insert(dotnet_args, "--no-build")
-    end
-
+-- TODO: Put this on utils
+local function launch_dotnet(args)
     local handle
     local pid_or_error
     local stdout = vim.loop.new_pipe(false)
@@ -48,7 +28,7 @@ local function launch_dotnet(opts)
             ["VSTEST_HOST_DEBUG"] = "1",
             ["VSTEST_CONNECTION_TIMEOUT"] = "10",
         },
-        args = dotnet_args,
+        args = args,
         detached = true,
         hide = true,
     }
@@ -77,21 +57,16 @@ local function launch_dotnet(opts)
     return pid_or_error
 end
 
-local function setup_adapter(dap)
-    -- TODO: Remote dap server
-    dap.adapters.coreclr = {
-        type = "executable",
-        command = "netcoredbg",
-        args = { "--interpreter=vscode" },
-    }
+local function get_current_project_path()
+    return vim.fn.expand("%:p:h")
 end
 
-local function get_current_file_project_dlls()
-    local scan = require_module("plenary").scandir
+local function get_current_project_dll()
+    local scan = utils.require_module("plenary").scandir
 
     -- FIX: People could move their bin folder elsewhere or change the name of the assembly, but
     -- that is outside of my scope ( Maybe I could parse the .csproj as a V2? )
-    local bufdir = vim.fn.expand("%:p:h")
+    local bufdir = get_current_project_path()
     local dirname = vim.fn.expand("%:p:h:t")
     local dlls = scan.scan_dir(bufdir .. "/bin", { depth = 3, search_pattern = dirname .. ".dll" })
 
@@ -115,6 +90,54 @@ local function get_current_file_project_dlls()
     return selection
 end
 
+-- returns treesitter capture info indicating what tests we should filter
+-- TODO: Change name ASAP
+local function get_test_current_context()
+    local ft = vim.api.nvim_buf_get_option(0, "filetype")
+    assert(ft == "cs", "dap-cs: can only debug cs files, not " .. ft)
+
+    local parsed_query = vim.treesitter.parse_query(ft, tests_query)
+    local current_node = ts_utils.get_node_at_cursor()
+
+    while current_node do
+        local iter = parsed_query:iter_captures(current_node, 0)
+        local capture_ID, capture_node = iter()
+
+        if capture_node == current_node then
+            if parsed_query.captures[capture_ID] == "class_name" then
+                return "class_name"
+            end
+            if parsed_query.captures[capture_ID] == "method_name" then
+                return "method_name"
+            end
+        end
+
+        current_node = current_node:parent()
+    end
+
+    return nil
+end
+
+local function setup_adapter(dap)
+    -- TODO: Remote dap server
+    dap.adapters.coreclr = {
+        type = "executable",
+        command = "netcoredbg",
+        args = { "--interpreter=vscode" },
+        enrich_config = function(config, on_config)
+            if config.request == "attach" and not config.processId then
+                local config_copy = vim.deepcopy(config)
+                local args = config.dotnet_extra_args or {}
+
+                table.insert(args, get_current_project_path)
+                config_copy.processId = launch_dotnet(args)
+
+                on_config(config_copy)
+            end
+        end,
+    }
+end
+
 local function setup_configuration(dap)
     dap.configurations.cs = {
         -- TODO:
@@ -125,7 +148,7 @@ local function setup_configuration(dap)
             type = "coreclr",
             name = "Debug Project",
             request = "launch",
-            program = get_current_file_project_dlls,
+            program = get_current_project_dll,
         },
         {
             type = "coreclr",
@@ -136,6 +159,14 @@ local function setup_configuration(dap)
             type = "coreclr",
             name = "Debug Test",
             request = "attach",
+            dotnet_extra_args = function()
+                local current_node_context = get_test_current_context()
+
+                -- FIX: Message LOL
+                assert(current_node_context, "") -- I don't think I have more options to stop the flow of this
+
+                return { "--filter", current_node_context }
+            end,
         },
         {
             type = "coreclr",
@@ -147,39 +178,19 @@ local function setup_configuration(dap)
     }
 end
 
-local function get_closest_test()
-    local ft = vim.api.nvim_buf_get_option(0, "filetype")
-    assert(ft == "cs", "dap-cs: can only debug cs files, not " .. ft)
-
-    local parser = vim.treesitter.get_parser(0)
-    local root = (parser:parse()[1]):root()
-    local parsed_query = vim.treesitter.parse_query(ft, single_test_query)
-
-    for _, match, _ in parsed_query:iter_matches(root, 0, 0, vim.api.nvim_win_get_cursor(0)[1]) do
-        print(match)
-    end
-
-    return ""
-end
-
 -- TODO: config: be able to change location of dotnet and netcoredbg executables
 -- TODO: config: don't build when running tests ( --no-build )
--- TODO: config: if current file is not test, run the last one
--- TODO: error_handling: check if the actual dotnet sdk is installed
--- TODO: error_handling: check if the dotnet sdk matches the current project
+-- TODO: config: if current file is not test, run the previous successful one
+-- TODO: error-handling: check if the actual dotnet sdk is installed
+-- TODO: error-handling: check if the dotnet sdk matches the current project
+
 function M.setup(opts)
-    local dap = require_module("dap")
-    require_executables({ "netcoredbg" })
+    local dap = utils.require_module("dap")
+    -- TODO: Should I really be doing this?
+    utils.require_executables({ "netcoredbg" })
 
     setup_adapter(dap)
     setup_configuration(dap)
 end
-
--- Debug:
---  Single Test
---  Single File Tests
-
--- TODO: config: override --no-build global flag
-function M.debug_test(opts) end
 
 return M

@@ -119,19 +119,25 @@ local function setup_adapter(dap)
         command = "netcoredbg",
         args = { "--interpreter=vscode" },
         enrich_config = function(config, on_config)
+            -- error
             if not config.program and not config.dotnet_extra_args then
                 return
             end
 
+            -- FIX: For now this always launch dotnet on test mode
             if config.request == "attach" and not config.processId then
-                utils.launch_dotnet({
-                    args = config.dotnet_extra_args,
-                    cwd = get_current_project_path(),
-                }, function(processId)
-                    config.processId = processId
-                    on_config(config)
-                end)
-                return
+                utils.launch_dotnet_test_debug(
+                    config.dotnet_extra_args,
+                    get_current_project_path(),
+                    function(pid)
+                        on_config({
+                            type = config.type,
+                            name = config.name,
+                            request = config.request,
+                            processId = pid,
+                        })
+                    end
+                )
             end
 
             on_config(config)
@@ -155,7 +161,8 @@ local function setup_configuration(dap)
             type = "coreclr",
             name = "Debug Tests",
             request = "attach",
-            dotnet_extra_args = { "test" },
+            -- FIX: I need to change this...
+            dotnet_extra_args = {},
         },
         {
             type = "coreclr",
@@ -166,9 +173,8 @@ local function setup_configuration(dap)
 
                 if test_filter then
                     return {
-                        "test",
                         "--filter",
-                        string.format("FullyQualifiedName=%s", test_filter),
+                        "FullyQualifiedName~" .. test_filter,
                     }
                 end
             end,
@@ -178,6 +184,8 @@ local function setup_configuration(dap)
             name = "Attach to Process",
             request = "attach",
             processId = require("dap.utils").pick_process,
+            -- FIX: I need to change this...
+            dotnet_extra_args = {},
         },
     }
 end
@@ -192,13 +200,5 @@ function M.setup(--[[ opts ]])
     setup_adapter(dap)
     setup_configuration(dap)
 end
-
-vim.keymap.set("n", "<Leader>ds", function()
-    require("dap").continue()
-end, { silent = true })
-
-vim.keymap.set("n", "<Leader>db", function()
-    require("dap").toggle_breakpoint()
-end, { silent = true })
 
 return M

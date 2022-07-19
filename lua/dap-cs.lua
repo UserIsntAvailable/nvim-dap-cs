@@ -25,10 +25,6 @@ local test_query = [[
   (#match? @attribute-name "^(Fact|Theory)(Attribute)?$"))
 ]]
 
--- ((method_declaration
---   name: (identifier) @method-name
---   body: (_)) @scope-root)
-
 local function require_module(module_name)
     local status_ok, module = pcall(require, module_name)
     assert(status_ok, string.format("dap-cs: '%s' plugin dependency is missing", module_name))
@@ -48,7 +44,13 @@ local function select_project_dll()
     local dirname = vim.fn.expand("%:p:h:t")
     local dlls = scan.scan_dir(bufdir .. "/bin", { depth = 3, search_pattern = dirname .. ".dll" })
 
-    if #dlls == 1 then
+    if #dlls == 0 then
+        vim.notify(
+            "dap-cs: no dll was found ( maybe you forgot to compile the project? )",
+            vim.log.levels.WARN
+        )
+        return
+    elseif #dlls == 1 then
         return dlls[1]
     end
 
@@ -61,7 +63,7 @@ local function select_project_dll()
     )
 
     if selection == nil then
-        return { error = "dap-cs: debug session canceled" }
+        vim.notify("dap-cs: selection canceled", vim.log.levels.WARN)
     end
 
     return selection
@@ -72,13 +74,14 @@ end
 local function get_current_cursor_test_scope()
     local ft = vim.api.nvim_buf_get_option(0, "filetype")
     if ft ~= "cs" then
-        return { error = "dap-cs: can only debug cs files, not " .. ft }
+        vim.notify("dap-cs: can only debug cs files, not " .. ft, vim.log.levels.ERROR)
+        return
     end
 
     local cs_query = vim.treesitter.parse_query(ts_parsers.ft_to_lang(ft), test_query)
     local node = ts_utils.get_node_at_cursor()
 
-    local method_identifier
+    local method_name
     while node do
         local iter = cs_query:iter_captures(node, 0)
         local capture_ID, capture_node = iter()
@@ -89,7 +92,7 @@ local function get_current_cursor_test_scope()
                     capture_ID, capture_node = iter()
                 end
 
-                method_identifier = query.get_node_text(capture_node, 0)
+                method_name = query.get_node_text(capture_node, 0)
             end
 
             if cs_query.captures[capture_ID] == "class-root" then
@@ -97,20 +100,16 @@ local function get_current_cursor_test_scope()
                     capture_ID, capture_node = iter()
                 end
 
-                local class_identifier = query.get_node_text(capture_node, 0)
+                local class_name = query.get_node_text(capture_node, 0)
 
-                -- stylua: ignore
-                return method_identifier
-                    and string.format("%s.%s", class_identifier, method_identifier)
-                    or class_identifier
-                -- stylua: end
+                return method_name and string.format("%s.%s", class_name, method_name) or class_name
             end
         end
 
         node = node:parent()
     end
 
-    return { error = "dap-cs: non-valid test scope found" }
+    vim.notify("dap-cs: non-valid test scope found", vim.log.levels.ERROR)
 end
 
 local function setup_adapter(dap)
@@ -120,16 +119,19 @@ local function setup_adapter(dap)
         command = "netcoredbg",
         args = { "--interpreter=vscode" },
         enrich_config = function(config, on_config)
-            local error = config.program.error or config.dotnet_extra_args.error or nil
-
-            if error then
-                return vim.notify(error, vim.log.levels.ERROR)
+            if not config.program and not config.dotnet_extra_args then
+                return
             end
 
             if config.request == "attach" and not config.processId then
-                local args = config.dotnet_extra_args or {}
-                table.insert(args, get_current_project_path())
-                config.processId = utils.launch_dotnet({ args = args })
+                utils.launch_dotnet({
+                    args = config.dotnet_extra_args,
+                    cwd = get_current_project_path(),
+                }, function(processId)
+                    config.processId = processId
+                    on_config(config)
+                end)
+                return
             end
 
             on_config(config)
@@ -153,6 +155,7 @@ local function setup_configuration(dap)
             type = "coreclr",
             name = "Debug Tests",
             request = "attach",
+            dotnet_extra_args = { "test" },
         },
         {
             type = "coreclr",
@@ -161,11 +164,13 @@ local function setup_configuration(dap)
             dotnet_extra_args = function()
                 local test_filter = get_current_cursor_test_scope()
 
-                if test_filter.error then
-                    return test_filter.error
+                if test_filter then
+                    return {
+                        "test",
+                        "--filter",
+                        string.format("FullyQualifiedName=%s", test_filter),
+                    }
                 end
-
-                return { "--filter", string.format("FullyQualifiedName=%s", test_filter) }
             end,
         },
         {
@@ -187,5 +192,13 @@ function M.setup(--[[ opts ]])
     setup_adapter(dap)
     setup_configuration(dap)
 end
+
+vim.keymap.set("n", "<Leader>ds", function()
+    require("dap").continue()
+end, { silent = true })
+
+vim.keymap.set("n", "<Leader>db", function()
+    require("dap").toggle_breakpoint()
+end, { silent = true })
 
 return M
